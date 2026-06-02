@@ -16,15 +16,7 @@ class Result extends Model
         'title',
         'url',
         'selftext',
-        'raw_data',
     ];
-
-    protected function casts(): array
-    {
-        return [
-            'raw_data' => 'array',
-        ];
-    }
 
     public function search(): BelongsTo
     {

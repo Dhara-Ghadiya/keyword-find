@@ -154,7 +154,6 @@ class RedditService
                     'title'       => Str::limit($post['title'] ?? 'Untitled', 255, ''),
                     'url'         => $post['url'] ?? '#',
                     'selftext'    => $selftext ?: null,
-                    'raw_data'    => $post,
                 ];
             })
             ->all();
@@ -263,11 +262,18 @@ class RedditService
             $fullname   = $m[1] ?? null;
             $externalId = $fullname ? str_replace('t3_', '', $fullname) : null;
 
-            // Extract selftext from RSS content field.
-            // Strip HTML tags and remove Reddit's "submitted by /u/... [link] [comments]" footer.
-            $rawContent = strip_tags((string) ($entry->content ?? $entry->summary ?? ''));
-            $selftext   = trim(preg_replace('/\s*submitted by\s.+$/su', '', $rawContent));
-            $selftext   = html_entity_decode($selftext, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            // Extract selftext from RSS content field:
+            // 1. Decode HTML entities first (&#32; → space, &#39; → apostrophe, etc.)
+            // 2. Strip HTML tags
+            // 3. Remove Reddit's "submitted by /u/... [link] [comments]" footer
+            // The order matters — regex uses \s which only matches after entity decoding.
+            $raw      = html_entity_decode(
+                (string) ($entry->content ?? $entry->summary ?? ''),
+                ENT_QUOTES | ENT_HTML5,
+                'UTF-8'
+            );
+            $raw      = strip_tags($raw);
+            $selftext = trim(preg_replace('/\s*submitted by\s.+$/su', '', $raw));
 
             $entries[] = [
                 'source'      => 'reddit',
@@ -276,7 +282,6 @@ class RedditService
                 'title'       => Str::limit((string) ($entry->title ?? 'Untitled'), 255, ''),
                 'url'         => $link ?: '#',
                 'selftext'    => $selftext ?: null,
-                'raw_data'    => [],
             ];
 
             $lastFullname = $fullname;
@@ -326,15 +331,15 @@ class RedditService
             return null;
         }
 
-        $rawResponse = $response->json();
-        $post        = $rawResponse[0]['data']['children'][0]['data'] ?? null;
+        $json = $response->json();
+        $post = $json[0]['data']['children'][0]['data'] ?? null;
 
         if (empty($post)) {
             $this->lastFailureReason = 'json_empty_post_data';
             return null;
         }
 
-        return $this->normalizeJsonPost($post, $rawResponse);
+        return $this->normalizeJsonPost($post);
     }
 
     // -------------------------------------------------------------------------
@@ -418,22 +423,30 @@ class RedditService
         // Use <published> for creation time; fall back to <updated>
         $publishedRaw = (string) ($entry->published ?? $entry->updated ?? '');
 
+        // Clean selftext same way as parseRssPage: decode entities → strip tags → remove footer
+        $rawSelftext = html_entity_decode(
+            (string) ($entry->content ?? $entry->summary ?? ''),
+            ENT_QUOTES | ENT_HTML5,
+            'UTF-8'
+        );
+        $rawSelftext = strip_tags($rawSelftext);
+        $selftext    = trim(preg_replace('/\s*submitted by\s.+$/su', '', $rawSelftext)) ?: null;
+
         return [
             'reddit_post_id'        => $externalId,
             'permalink'             => $permalink,
             'title'                 => Str::limit((string) ($entry->title ?? 'Untitled'), 255, ''),
-            'selftext'              => strip_tags((string) ($entry->content ?? $entry->summary ?? '')) ?: null,
+            'selftext'              => $selftext,
             'url'                   => $link ?: ('https://www.reddit.com' . $permalink),
             'author'                => $author ?: null,
             'ups'                   => 0,
             'downs'                 => 0,
             'total_awards_received' => 0,
             'created_utc'           => $publishedRaw ? strtotime($publishedRaw) : now()->timestamp,
-            'raw_json'              => null,
         ];
     }
 
-    private function normalizeJsonPost(array $post, array $rawResponse): array
+    private function normalizeJsonPost(array $post): array
     {
         $selftext = $post['selftext'] ?? '';
         if (in_array($selftext, ['[deleted]', '[removed]'], true)) {
@@ -453,7 +466,6 @@ class RedditService
             'downs'                 => (int) ($post['downs'] ?? 0),
             'total_awards_received' => (int) ($post['total_awards_received'] ?? 0),
             'created_utc'           => (int) ($post['created_utc'] ?? now()->timestamp),
-            'raw_json'              => $rawResponse,
         ];
     }
 

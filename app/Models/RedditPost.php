@@ -20,7 +20,6 @@ class RedditPost extends Model
         'downs',
         'total_awards_received',
         'created_utc',
-        'raw_json',
     ];
 
     protected function casts(): array
@@ -30,7 +29,6 @@ class RedditPost extends Model
             'downs'                 => 'integer',
             'total_awards_received' => 'integer',
             'created_utc'           => 'integer',
-            'raw_json'              => 'array',
         ];
     }
 

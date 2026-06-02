@@ -87,7 +87,6 @@ class FetchKeywordResultsJob implements ShouldQueue
             'title'       => $r['title'],
             'url'         => $r['url'],
             'selftext'    => $r['selftext'] ?? null,
-            'raw_data'    => $r['raw_data'] ?? null,
         ]));
     }
 
@@ -185,8 +184,7 @@ class FetchKeywordResultsJob implements ShouldQueue
                     'permalink'   => null,
                     'title'       => Str::limit($item['title'] ?? 'Untitled', 255, ''),
                     'url'         => $item['link'] ?? '#',
-                    'selftext'    => null,   // Google results have no selftext
-                    'raw_data'    => $item,
+                    'selftext'    => null,
                 ];
 
                 if (count($results) >= $limit) {
