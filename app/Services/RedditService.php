@@ -6,6 +6,7 @@ use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use RuntimeException;
 use Throwable;
 
 /**
@@ -22,6 +23,15 @@ use Throwable;
 class RedditService
 {
     private const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    /** Reason why the last fetchPostDetail() returned null. */
+    private string $lastFailureReason = '';
+
+    /** HTTP status code of the last Reddit API response (0 = connection error / not set). */
+    private int $lastHttpStatus = 0;
+
+    /** First 300 chars of the last Reddit API response body (for debug logging). */
+    private string $lastResponseSnippet = '';
 
     // -------------------------------------------------------------------------
     // Public API
@@ -49,14 +59,46 @@ class RedditService
         return $results;
     }
 
+    /** Human-readable reason why the last fetchPostDetail() returned null. */
+    public function getLastFailureReason(): string
+    {
+        return $this->lastFailureReason;
+    }
+
+    /** HTTP status code of the last Reddit API response (0 = never set / connection error). */
+    public function getLastHttpStatus(): int
+    {
+        return $this->lastHttpStatus;
+    }
+
+    /** First 300 chars of the last Reddit API response body, for debug logging. */
+    public function getLastResponseSnippet(): string
+    {
+        return $this->lastResponseSnippet;
+    }
+
     /**
      * Fetch detailed Reddit post data for a given permalink.
      * Tries public .json first; falls back to public RSS.
+     *
+     * @throws RuntimeException on RSS 429 — triggers job retry with backoff.
+     * @return array<string,mixed>|null  null = post unavailable (see getLastFailureReason()).
      */
     public function fetchPostDetail(string $permalink): ?array
     {
-        return $this->fetchDetailViaJson($permalink)
-            ?? $this->fetchDetailViaRss($permalink);
+        $this->lastFailureReason    = '';
+        $this->lastHttpStatus       = 0;
+        $this->lastResponseSnippet  = '';
+
+        $data = $this->fetchDetailViaJson($permalink);
+
+        if ($data !== null) {
+            return $data;
+        }
+
+        $data = $this->fetchDetailViaRss($permalink);
+
+        return $data;
     }
 
     // -------------------------------------------------------------------------
@@ -66,7 +108,7 @@ class RedditService
     private function searchViaJson(string $keyword, int $limit): array
     {
         try {
-            $response = $this->jsonClient()
+            $response = $this->jsonClient(15)  // search needs more time than detail
                 ->get('https://www.reddit.com/search.json', [
                     'q'     => $keyword,
                     'limit' => min($limit, 100),
@@ -100,6 +142,9 @@ class RedditService
             ->map(function (array $child, int $index) {
                 $post = $child['data'] ?? [];
 
+                // selftext is the post body. Empty for link posts (posts sharing external URLs).
+                $selftext = trim($post['selftext'] ?? '');
+
                 return [
                     'source'      => 'reddit',
                     'external_id' => $post['id'] ?? null,
@@ -108,8 +153,7 @@ class RedditService
                         : null,
                     'title'       => Str::limit($post['title'] ?? 'Untitled', 255, ''),
                     'url'         => $post['url'] ?? '#',
-                    'snippet'     => Str::limit($post['selftext'] ?? '', 500, ''),
-                    'position'    => $index + 1,
+                    'selftext'    => $selftext ?: null,
                     'raw_data'    => $post,
                 ];
             })
@@ -161,12 +205,24 @@ class RedditService
             [$entries, $lastFullname] = $this->parseRssPage($response->body());
 
             if (empty($entries)) {
-                break;  // no more results
+                break;  // no more results from Reddit
             }
 
-            $all   = array_merge($all, $entries);
+            // Filter: keep only actual posts (/comments/ path).
+            // Reddit RSS mixes subreddit home pages (e.g. /r/hardware/) with posts.
+            // Subreddit pages have no post detail and must be excluded so that
+            // results_count == reddit_posts count after processing.
+            $posts = array_values(array_filter(
+                $entries,
+                fn (array $e) => str_contains($e['permalink'] ?? '', '/comments/')
+            ));
+
+            $all   = array_merge($all, $posts);
             $after = $lastFullname;
             $page++;
+
+            // Use raw entry count (not filtered) for pagination:
+            // if Reddit returned a full page there may be more results to fetch.
 
             // Stop if Reddit returned fewer than a full page (no more results)
             if (! $after || count($entries) < $perPage) {
@@ -207,18 +263,19 @@ class RedditService
             $fullname   = $m[1] ?? null;
             $externalId = $fullname ? str_replace('t3_', '', $fullname) : null;
 
+            // Extract selftext from RSS content field.
+            // Strip HTML tags and remove Reddit's "submitted by /u/... [link] [comments]" footer.
+            $rawContent = strip_tags((string) ($entry->content ?? $entry->summary ?? ''));
+            $selftext   = trim(preg_replace('/\s*submitted by\s.+$/su', '', $rawContent));
+            $selftext   = html_entity_decode($selftext, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
             $entries[] = [
                 'source'      => 'reddit',
                 'external_id' => $externalId,
                 'permalink'   => $permalink,
                 'title'       => Str::limit((string) ($entry->title ?? 'Untitled'), 255, ''),
                 'url'         => $link ?: '#',
-                'snippet'     => Str::limit(
-                    strip_tags((string) ($entry->content ?? $entry->summary ?? '')),
-                    500,
-                    ''
-                ),
-                'position'    => count($entries) + 1,  // will be renumbered after merge
+                'selftext'    => $selftext ?: null,
                 'raw_data'    => [],
             ];
 
@@ -239,6 +296,7 @@ class RedditService
         try {
             $response = $this->jsonClient()->get($url);
         } catch (Throwable $e) {
+            $this->lastFailureReason = 'json_connection_error: ' . $e->getMessage();
             Log::warning('Reddit detail JSON: connection failed', [
                 'permalink' => $permalink,
                 'error'     => $e->getMessage(),
@@ -246,8 +304,25 @@ class RedditService
             return null;
         }
 
-        // 403 = CDN block — fall through to RSS
-        if ($response->status() === 403 || $response->failed()) {
+        $this->lastHttpStatus      = $response->status();
+        $this->lastResponseSnippet = substr($response->body(), 0, 300);
+
+        // 403 = CDN block, 429 = rate limit — both fall through to RSS silently.
+        if ($response->status() === 403) {
+            $this->lastFailureReason = 'json_403_blocked_by_cdn';
+            return null;
+        }
+
+        if ($response->status() === 429) {
+            $this->lastFailureReason = 'json_429_rate_limited';
+            Log::info('Reddit detail JSON: rate-limited (429), falling back to RSS', [
+                'permalink' => $permalink,
+            ]);
+            return null;
+        }
+
+        if ($response->failed()) {
+            $this->lastFailureReason = 'json_http_' . $response->status();
             return null;
         }
 
@@ -255,6 +330,7 @@ class RedditService
         $post        = $rawResponse[0]['data']['children'][0]['data'] ?? null;
 
         if (empty($post)) {
+            $this->lastFailureReason = 'json_empty_post_data';
             return null;
         }
 
@@ -270,6 +346,7 @@ class RedditService
         preg_match('#/comments/([a-z0-9]+)#i', $permalink, $m);
 
         if (empty($m[1])) {
+            $this->lastFailureReason = 'rss_cannot_extract_post_id';
             Log::warning('Reddit detail RSS: cannot extract post ID', ['permalink' => $permalink]);
             return null;
         }
@@ -279,17 +356,39 @@ class RedditService
         try {
             $response = $this->rssClient()->get($rssUrl);
         } catch (Throwable $e) {
-            Log::warning('Reddit detail RSS: connection failed', [
+            $this->lastFailureReason = 'rss_connection_error: ' . $e->getMessage();
+            Log::warning('Reddit detail RSS: connection error — will retry', [
                 'permalink' => $permalink,
                 'error'     => $e->getMessage(),
             ]);
+            // Timeout / connection reset are transient — throw so the job retries with backoff.
+            throw new RuntimeException(
+                'Reddit RSS connection error for ' . $permalink . ': ' . $e->getMessage()
+            );
+        }
+
+        $this->lastHttpStatus      = $response->status();
+        $this->lastResponseSnippet = substr($response->body(), 0, 300);
+
+        if ($response->status() === 429) {
+            $this->lastFailureReason = 'rss_429_rate_limited';
+            throw new RuntimeException(
+                'Reddit RSS rate-limited (429) for ' . $permalink
+            );
+        }
+
+        if ($response->status() === 404) {
+            $this->lastFailureReason = 'rss_404_post_not_found';
+            Log::info('Reddit detail RSS: post not found (404)', ['permalink' => $permalink]);
             return null;
         }
 
         if ($response->failed()) {
+            $this->lastFailureReason = 'rss_http_' . $response->status();
             Log::warning('Reddit detail RSS: bad HTTP response', [
                 'permalink' => $permalink,
                 'status'    => $response->status(),
+                'body'      => $this->lastResponseSnippet,
             ]);
             return null;
         }
@@ -302,6 +401,7 @@ class RedditService
         $xml = @simplexml_load_string(preg_replace('/xmlns="[^"]*"/', '', $body));
 
         if (! $xml || empty($xml->entry)) {
+            $this->lastFailureReason = $xml ? 'rss_feed_empty_no_entries' : 'rss_xml_parse_failed';
             return null;
         }
 
@@ -378,19 +478,30 @@ class RedditService
         return $path ? rtrim($path, '/') . '/' : null;
     }
 
-    private function jsonClient(): PendingRequest
+    /**
+     * HTTP client for JSON API calls.
+     *
+     * Search: timeout(15) — search.json either 403s immediately or responds fast.
+     * Detail: timeout(5)  — Reddit CDN stalls at 955 bytes then drops the connection;
+     *                        fail fast so the RSS fallback runs without wasting 15s.
+     */
+    private function jsonClient(int $timeout = 5): PendingRequest
     {
-        return Http::timeout(15)
-            ->connectTimeout(5)
+        return Http::timeout($timeout)
+            ->connectTimeout(4)
             ->withHeaders([
                 'User-Agent' => self::USER_AGENT,
                 'Accept'     => 'application/json, text/plain, */*',
             ]);
     }
 
-    private function rssClient(): PendingRequest
+    /**
+     * HTTP client for RSS feed calls.
+     * RSS is the reliable path — give it enough time to respond.
+     */
+    private function rssClient(int $timeout = 25): PendingRequest
     {
-        return Http::timeout(15)
+        return Http::timeout($timeout)
             ->connectTimeout(5)
             ->withHeaders([
                 'User-Agent' => self::USER_AGENT,

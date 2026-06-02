@@ -26,7 +26,7 @@ class FetchKeywordResultsJob implements ShouldQueue
     use Queueable;
 
     public int $tries   = 1;
-    public int $timeout = 120;
+    public int $timeout = 300; // 4-page RSS (4×15s) + DB ops + dispatching 100 jobs
 
     public function __construct(
         public readonly int $searchId
@@ -40,10 +40,15 @@ class FetchKeywordResultsJob implements ShouldQueue
 
         try {
             $results = collect()
-                ->merge($reddit->search($search->keyword, 100))
-                ->merge($this->searchGoogle($search->keyword, 100))
+                ->merge($reddit->search($search->keyword, 25))
+                ->merge($this->searchGoogle($search->keyword, 25))
                 ->unique(fn (array $r) => Str::lower($r['source'] . '|' . $r['title'] . '|' . $r['url']))
-                ->take(100)
+                // Safety: drop any Reddit subreddit home pages that slipped through
+                ->filter(fn (array $r) =>
+                    $r['source'] !== 'reddit' ||
+                    str_contains($r['permalink'] ?? '', '/comments/')
+                )
+                ->take(25)
                 ->values();
 
             $savedResults = $this->storeResults($search->id, $results);
@@ -81,8 +86,7 @@ class FetchKeywordResultsJob implements ShouldQueue
             'permalink'   => $r['permalink'] ?? null,
             'title'       => $r['title'],
             'url'         => $r['url'],
-            'snippet'     => $r['snippet'] ?? null,
-            'position'    => $r['position'] ?? null,
+            'selftext'    => $r['selftext'] ?? null,
             'raw_data'    => $r['raw_data'] ?? null,
         ]));
     }
@@ -93,16 +97,38 @@ class FetchKeywordResultsJob implements ShouldQueue
 
     private function dispatchDetailJobs(Collection $savedResults, int $searchId): void
     {
+        $dispatched = 0;
+        $skipped    = 0;
+
         $savedResults
             ->filter(fn (Result $r) => $r->source === 'reddit' && filled($r->permalink))
             ->values()
-            ->each(function (Result $result) use ($searchId) {
+            ->each(function (Result $result) use ($searchId, &$dispatched, &$skipped) {
+                // Skip subreddit home pages (e.g. /r/PHP/) — they are not posts,
+                // have no /comments/ path, and will always fail the detail fetch.
+                if (! str_contains($result->permalink, '/comments/')) {
+                    Log::info('FetchKeywordResultsJob: skipping subreddit link (not a post)', [
+                        'result_id' => $result->id,
+                        'permalink' => $result->permalink,
+                    ]);
+                    $skipped++;
+                    return;
+                }
+
                 FetchRedditPostDetailJob::dispatch(
                     $result->id,
                     $searchId,
                     $result->permalink,
-                );
+                )->onQueue('reddit-detail');
+
+                $dispatched++;
             });
+
+        Log::info('FetchKeywordResultsJob: detail jobs dispatched', [
+            'search_id'  => $searchId,
+            'dispatched' => $dispatched,
+            'skipped'    => $skipped,
+        ]);
     }
 
     // -------------------------------------------------------------------------
@@ -141,8 +167,7 @@ class FetchKeywordResultsJob implements ShouldQueue
             return [];
         }
 
-        $results  = [];
-        $position = 1;
+        $results = [];
 
         foreach ($responses as $response) {
             if (! $response->successful()) {
@@ -160,8 +185,7 @@ class FetchKeywordResultsJob implements ShouldQueue
                     'permalink'   => null,
                     'title'       => Str::limit($item['title'] ?? 'Untitled', 255, ''),
                     'url'         => $item['link'] ?? '#',
-                    'snippet'     => $item['snippet'] ?? null,
-                    'position'    => $position++,
+                    'selftext'    => null,   // Google results have no selftext
                     'raw_data'    => $item,
                 ];
 

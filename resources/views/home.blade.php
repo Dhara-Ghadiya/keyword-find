@@ -114,7 +114,7 @@
                             <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                                 <h2 class="text-sm font-semibold text-slate-900">Latest results</h2>
                                 <p class="text-xs font-medium text-slate-500">
-                                    Showing {{ min($latestSearch->results_count, 100) }} of {{ $latestSearch->results_count }} saved results
+                                    Showing {{ min($latestSearch->results_count, 25) }} of {{ $latestSearch->results_count }} saved results
                                 </p>
                             </div>
                         </div>
@@ -125,7 +125,7 @@
                                     <div class="flex items-start justify-between gap-4">
                                         <div class="min-w-0">
                                             <p class="truncate text-sm font-semibold text-slate-950">{{ $result->title }}</p>
-                                            <p class="mt-1 line-clamp-2 text-sm text-slate-600">{{ $result->snippet }}</p>
+                                            <p class="mt-1 line-clamp-2 text-sm text-slate-600">{{ $result->selftext }}</p>
                                         </div>
 
                                         <span class="shrink-0 rounded-full border border-slate-200 px-2 py-1 text-xs font-semibold capitalize text-slate-500">

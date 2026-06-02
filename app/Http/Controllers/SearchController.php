@@ -13,7 +13,7 @@ class SearchController extends Controller
     public function index(): View
     {
         $latestSearch = Search::with(['results' => function ($query) {
-            $query->orderBy('source')->orderBy('position')->limit(100);
+            $query->orderBy('source')->limit(25);
         }])->withCount('results')->latest()->first();
 
         $recentSearches = Search::withCount('results')

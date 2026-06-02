@@ -15,8 +15,7 @@ class Result extends Model
         'permalink',
         'title',
         'url',
-        'snippet',
-        'position',
+        'selftext',
         'raw_data',
     ];
 
