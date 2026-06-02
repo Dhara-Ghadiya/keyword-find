@@ -114,7 +114,6 @@ class FetchRedditPostDetailJob implements ShouldQueue
                         'downs'                 => (int) ($data['downs'] ?? 0),
                         'total_awards_received' => (int) ($data['total_awards_received'] ?? 0),
                         'created_utc'           => (int) ($data['created_utc'] ?? now()->timestamp),
-                        'raw_json'              => $data['raw_json'] ?? null,
                         'permalink'             => $data['permalink'],
                     ]);
 
@@ -192,32 +191,25 @@ class FetchRedditPostDetailJob implements ShouldQueue
             return false;
         }
 
-        // raw_data is populated when search was done via search.json —
-        // it contains the full Reddit API post object including ups/downs/author.
-        $rawData    = is_array($result->raw_data) ? $result->raw_data : [];
-        $hasRawData = ! empty($rawData) && isset($rawData['id']);
-
         $this->store([
             'search_id'             => $this->searchId,
             'result_id'             => $this->resultId,
-            'reddit_post_id'        => $result->external_id ?? ($rawData['id'] ?? null),
+            'reddit_post_id'        => $result->external_id,
             'permalink'             => $this->permalink,
             'title'                 => $result->title,
             'selftext'              => $result->selftext ?? null,
             'url'                   => $result->url,
-            'author'                => $rawData['author'] ?? null,
-            'ups'                   => (int) ($rawData['ups'] ?? 0),
-            'downs'                 => (int) ($rawData['downs'] ?? 0),
-            'total_awards_received' => (int) ($rawData['total_awards_received'] ?? 0),
-            'created_utc'           => (int) ($rawData['created_utc'] ?? $result->created_at?->timestamp ?? 0),
-            'raw_json'              => $hasRawData ? $rawData : null,
+            'author'                => null,
+            'ups'                   => 0,
+            'downs'                 => 0,
+            'total_awards_received' => 0,
+            'created_utc'           => (int) ($result->created_at?->timestamp ?? 0),
         ]);
 
         Log::info('FetchRedditPostDetailJob: stored via fallback (results table)', [
             'result_id'       => $this->resultId,
             'permalink'       => $this->permalink,
             'api_fail_reason' => $apiFailReason,
-            'has_raw_data'    => $hasRawData,
         ]);
 
         return true;
