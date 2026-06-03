@@ -4,31 +4,19 @@ namespace App\Http\Controllers;
 
 use App\Jobs\FetchKeywordResultsJob;
 use App\Models\Search;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
-use Illuminate\Http\RedirectResponse;
 
 class SearchController extends Controller
 {
+    /** Homepage — search form only. */
     public function index(): View
     {
-        $latestSearch = Search::with(['results' => function ($query) {
-            $query->orderBy('source')->limit(25);
-        }])->withCount('results')->latest()->first();
-
-        $recentSearches = Search::withCount('results')
-            ->latest()
-            ->take(5)
-            ->get();
-
-        return view('home', [
-            'latestSearch' => $latestSearch,
-            'recentSearches' => $recentSearches,
-            'googleConfigured' => filled(config('services.google.search_api_key'))
-                && filled(config('services.google.search_engine_id')),
-        ]);
+        return view('home');
     }
 
+    /** Validate keyword, create search record, dispatch job, redirect to results page. */
     public function store(Request $request): RedirectResponse
     {
         $validated = $request->validate([
@@ -37,13 +25,25 @@ class SearchController extends Controller
 
         $search = Search::create([
             'keyword' => $validated['keyword'],
-            'status' => 'queued',
+            'status'  => 'queued',
         ]);
 
         FetchKeywordResultsJob::dispatch($search->id);
 
-        return redirect()
-            ->route('home')
-            ->with('status', 'Keyword queued. Results will appear automatically in a few seconds.');
+        return redirect()->route('searches.show', $search);
+    }
+
+    /** Results page for a specific search. */
+    public function show(Search $search): View
+    {
+        $search->loadCount('results');
+
+        if ($search->results_count > 0) {
+            $search->load(['results' => function ($query) {
+                $query->orderBy('source')->limit(25);
+            }]);
+        }
+
+        return view('searches.show', compact('search'));
     }
 }

@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Route;
 
 Route::get('/', [SearchController::class, 'index'])->name('home');
 Route::post('/searches', [SearchController::class, 'store'])->name('searches.store');
+Route::get('/searches/{search}', [SearchController::class, 'show'])->name('searches.show');
 
 Route::get('/reddit-posts', [RedditPostController::class, 'index'])->name('reddit-posts.index');
 Route::post('/reddit-posts', [RedditPostController::class, 'store'])->name('reddit-posts.store');
