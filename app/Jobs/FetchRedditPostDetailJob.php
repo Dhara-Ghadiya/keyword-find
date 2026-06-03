@@ -35,9 +35,7 @@ class FetchRedditPostDetailJob implements ShouldQueue
         public readonly int    $resultId,
         public readonly int    $searchId,
         public readonly string $permalink,
-    ) {
-        $this->onQueue('reddit-detail');
-    }
+    ) {}
 
     public function backoff(): array
     {

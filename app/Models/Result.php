@@ -10,6 +10,7 @@ class Result extends Model
 {
     protected $fillable = [
         'search_id',
+        'batch_number',
         'source',
         'external_id',
         'permalink',

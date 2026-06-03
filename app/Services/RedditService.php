@@ -59,6 +59,200 @@ class RedditService
         return $results;
     }
 
+    // -------------------------------------------------------------------------
+    // Paginated search (sort=new + after token) — used by FetchKeywordResultsJob
+    // -------------------------------------------------------------------------
+
+    /**
+     * Fetch the next page (25) of Reddit posts for a keyword.
+     *
+     * Returns normalized flat post arrays — same shape whether JSON or RSS was used.
+     * IMPORTANT: sort=new must NEVER change for the same keyword search session;
+     * Reddit's `after` pagination token is coupled to the sort parameter.
+     *
+     * Strategy:
+     *  1. search.json — full data (ups/downs/author). Falls back silently on 403/429.
+     *  2. search.rss  — always works, limited fields (no ups/downs/author).
+     *
+     * @param  string|null $afterToken  Reddit fullname token (e.g. "t3_abc123"), null = first page
+     * @return array{posts: array, after: string|null, before: string|null, total_found: int}
+     * @throws \Exception on non-recoverable failures (used by job to mark search as failed)
+     */
+    public function searchPosts(string $keyword, ?string $afterToken = null): array
+    {
+        $result = $this->searchPostsViaJson($keyword, $afterToken);
+
+        if ($result !== null) {
+            return $result;
+        }
+
+        Log::info('Reddit searchPosts: JSON unavailable — falling back to RSS', [
+            'keyword' => $keyword,
+            'after'   => $afterToken,
+        ]);
+
+        return $this->searchPostsViaRss($keyword, $afterToken);
+    }
+
+    /**
+     * Try search.json. Returns null on 403/429/connection error so caller falls back to RSS.
+     */
+    private function searchPostsViaJson(string $keyword, ?string $afterToken): ?array
+    {
+        $params = [
+            'q'     => $keyword,
+            'limit' => 25,
+            'sort'  => 'new',
+            't'     => 'all',
+            'type'  => 'link',
+        ];
+        if ($afterToken !== null) {
+            $params['after'] = $afterToken;
+        }
+
+        try {
+            $response = $this->jsonClient(10)->get('https://www.reddit.com/search.json', $params);
+        } catch (Throwable $e) {
+            Log::warning('Reddit searchPosts JSON: connection failed — trying RSS', [
+                'keyword' => $keyword,
+                'error'   => $e->getMessage(),
+            ]);
+            return null;
+        }
+
+        // 403 = CDN block, 429 = rate-limited — fall through to RSS silently
+        if (in_array($response->status(), [403, 429], true) || $response->failed()) {
+            Log::info('Reddit searchPosts JSON: blocked/failed — trying RSS', [
+                'keyword' => $keyword,
+                'status'  => $response->status(),
+            ]);
+            return null;
+        }
+
+        $data     = $response->json();
+        $children = $data['data']['children'] ?? [];
+        $newAfter = $data['data']['after'] ?? null;
+
+        $posts = collect($children)->map(function (array $child) {
+            $p        = $child['data'] ?? [];
+            $selftext = trim($p['selftext'] ?? '');
+            if (in_array($selftext, ['[deleted]', '[removed]'], true)) {
+                $selftext = '';
+            }
+
+            return [
+                'id'                    => $p['id'] ?? null,
+                'permalink'             => isset($p['permalink'])
+                    ? rtrim($p['permalink'], '/') . '/'
+                    : null,
+                'title'                 => $p['title'] ?? 'Untitled',
+                'selftext'              => $selftext,
+                'url'                   => $p['url'] ?? '#',
+                'author'                => $p['author'] ?? null,
+                'ups'                   => (int) ($p['ups'] ?? 0),
+                'downs'                 => (int) ($p['downs'] ?? 0),
+                'total_awards_received' => (int) ($p['total_awards_received'] ?? 0),
+                'created_utc'           => (int) ($p['created_utc'] ?? 0),
+            ];
+        })->all();
+
+        Log::info('Reddit searchPosts JSON: success', [
+            'keyword'   => $keyword,
+            'after_in'  => $afterToken,
+            'after_out' => $newAfter,
+            'count'     => count($posts),
+        ]);
+
+        return [
+            'posts'       => $posts,
+            'after'       => $newAfter,
+            'before'      => $data['data']['before'] ?? null,
+            'total_found' => count($posts),
+        ];
+    }
+
+    /**
+     * Fetch one page via RSS. Always works. Returns the same normalized shape as the JSON path.
+     *
+     * `after` token for the next page: the Reddit fullname of the last entry in this page,
+     * but only when we received a full page (≥25 raw entries). Fewer = last page.
+     *
+     * @throws \Exception on connection failures (triggers job retry)
+     */
+    private function searchPostsViaRss(string $keyword, ?string $afterToken): array
+    {
+        $params = [
+            'q'     => $keyword,
+            'limit' => 25,
+            'sort'  => 'new',
+            't'     => 'all',
+        ];
+        if ($afterToken !== null) {
+            $params['after'] = $afterToken;
+        }
+
+        try {
+            $response = $this->rssClient()->get('https://www.reddit.com/search.rss', $params);
+        } catch (Throwable $e) {
+            Log::error('Reddit searchPosts RSS: connection failed', [
+                'keyword' => $keyword,
+                'error'   => $e->getMessage(),
+            ]);
+            throw new \Exception('Reddit RSS connection failed: ' . $e->getMessage());
+        }
+
+        if ($response->failed()) {
+            Log::error('Reddit searchPosts RSS: bad response', [
+                'keyword' => $keyword,
+                'status'  => $response->status(),
+            ]);
+            throw new \Exception('Reddit RSS request failed: HTTP ' . $response->status());
+        }
+
+        [$rawEntries, $lastFullname] = $this->parseRssPage($response->body());
+
+        // Keep only actual posts — RSS search mixes subreddit home pages with post links
+        $posts = array_values(array_filter(
+            $rawEntries,
+            fn (array $e) => str_contains($e['permalink'] ?? '', '/comments/')
+        ));
+
+        // A full page (≥25 raw entries) means there are more results; use last fullname as cursor
+        $newAfter = (count($rawEntries) >= 25 && $lastFullname) ? $lastFullname : null;
+
+        $normalizedPosts = collect($posts)->map(fn (array $e) => [
+            'id'                    => $e['external_id'] ?? null,
+            'permalink'             => $e['permalink'] ?? null,
+            'title'                 => $e['title'] ?? 'Untitled',
+            'selftext'              => $e['selftext'] ?? '',
+            'url'                   => $e['url'] ?? '#',
+            'author'                => null,   // not available in search RSS
+            'ups'                   => 0,
+            'downs'                 => 0,
+            'total_awards_received' => 0,
+            'created_utc'           => 0,
+        ])->all();
+
+        Log::info('Reddit searchPosts RSS: success', [
+            'keyword'   => $keyword,
+            'after_in'  => $afterToken,
+            'after_out' => $newAfter,
+            'raw_count' => count($rawEntries),
+            'count'     => count($normalizedPosts),
+        ]);
+
+        return [
+            'posts'       => $normalizedPosts,
+            'after'       => $newAfter,
+            'before'      => null,
+            'total_found' => count($normalizedPosts),
+        ];
+    }
+
+    // -------------------------------------------------------------------------
+    // Public getters
+    // -------------------------------------------------------------------------
+
     /** Human-readable reason why the last fetchPostDetail() returned null. */
     public function getLastFailureReason(): string
     {
