@@ -16,34 +16,75 @@ class SearchController extends Controller
         return view('home');
     }
 
-    /** Validate keyword, create search record, dispatch job, redirect to results page. */
+    /**
+     * Validate keyword, find or create a Search record, dispatch fetch job,
+     * redirect to the results page.
+     *
+     * Same keyword → continues pagination (fetches next 25 posts).
+     */
     public function store(Request $request): RedirectResponse
     {
-        $validated = $request->validate([
+        $request->validate([
             'keyword' => ['required', 'string', 'min:2', 'max:191'],
         ]);
 
-        $search = Search::create([
-            'keyword' => $validated['keyword'],
-            'status'  => 'queued',
-        ]);
+        $keyword = trim($request->input('keyword'));
+
+        // Find the most recent search record for this keyword
+        $search = Search::where('keyword', $keyword)->latest()->first();
+
+        // All Reddit posts for this keyword have been fetched
+        if ($search && $search->is_fully_synced) {
+            return redirect()
+                ->route('searches.show', $search)
+                ->with('info', 'All available Reddit posts for "' . $keyword . '" have been fetched ('
+                    . $search->total_fetched . ' total). Reddit has no more results.');
+        }
+
+        // Rate-limit: prevent hammering the same keyword within 1 minute
+        if ($search
+            && $search->last_synced_at
+            && $search->last_synced_at->diffInSeconds(now()) < 60
+            && in_array($search->status, ['queued', 'running'], true)
+        ) {
+            return redirect()
+                ->route('searches.show', $search)
+                ->with('warning', 'This keyword is already being fetched. Please wait.');
+        }
+
+        // First search for this keyword → create new record
+        if (! $search) {
+            $search = Search::create([
+                'keyword'         => $keyword,
+                'status'          => 'queued',
+                'reddit_after'    => null,
+                'is_fully_synced' => false,
+                'total_fetched'   => 0,
+            ]);
+        } else {
+            // Subsequent search → reuse record, queue next batch
+            $search->update(['status' => 'queued']);
+        }
 
         FetchKeywordResultsJob::dispatch($search->id);
 
         return redirect()->route('searches.show', $search);
     }
 
-    /** Results page for a specific search. */
+    /**
+     * Results page for a specific search.
+     * Results paginated 25 per page, ordered by batch then insertion order.
+     */
     public function show(Search $search): View
     {
         $search->loadCount('results');
 
-        if ($search->results_count > 0) {
-            $search->load(['results' => function ($query) {
-                $query->orderBy('source')->limit(25);
-            }]);
-        }
+        $results = $search->results()
+            ->with('redditPost')
+            ->orderBy('batch_number')
+            ->orderBy('id')
+            ->paginate(25);
 
-        return view('searches.show', compact('search'));
+        return view('searches.show', compact('search', 'results'));
     }
 }
