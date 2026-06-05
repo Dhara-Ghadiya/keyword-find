@@ -70,6 +70,18 @@ class RedditService
 
     /**
      * Try search.json. Returns null on 403/429/connection error so caller falls back to RSS.
+     *
+     * IMPORTANT: `type=link` is intentionally OMITTED.
+     * Reddit's search API treats `type=link` as "link-type submissions only" (posts with
+     * external URLs). Self/text posts are excluded. For broad keywords like "opportunities"
+     * or "ui/ux designer", the majority of posts ARE self/text posts. Using `type=link`
+     * caps the result set at link-only posts and triggers `after=null` far too early,
+     * causing is_fully_synced=true when hundreds of posts remain available.
+     *
+     * Without `type`, Reddit may include t5 (subreddit) or t2 (user) entries in the
+     * children array. We filter to kind=t3 (post submissions) only before returning, so
+     * those entries never reach the job. The pagination `after` token from `data.after`
+     * remains valid regardless — it is position-based across all 25 raw children.
      */
     private function searchPostsViaJson(string $keyword, ?string $afterToken): ?array
     {
@@ -78,17 +90,21 @@ class RedditService
             'limit' => 25,
             'sort'  => 'new',
             't'     => 'all',
-            'type'  => 'link',
+            // type=link intentionally omitted — see docblock above
         ];
         if ($afterToken !== null) {
             $params['after'] = $afterToken;
         }
+
+        $apiUrl = 'https://www.reddit.com/search.json?' . http_build_query($params);
 
         try {
             $response = $this->jsonClient(10)->get('https://www.reddit.com/search.json', $params);
         } catch (Throwable $e) {
             Log::warning('Reddit searchPosts JSON: connection failed — trying RSS', [
                 'keyword' => $keyword,
+                'after'   => $afterToken,
+                'api_url' => $apiUrl,
                 'error'   => $e->getMessage(),
             ]);
             return null;
@@ -98,6 +114,8 @@ class RedditService
         if (in_array($response->status(), [403, 429], true) || $response->failed()) {
             Log::info('Reddit searchPosts JSON: blocked/failed — trying RSS', [
                 'keyword' => $keyword,
+                'after'   => $afterToken,
+                'api_url' => $apiUrl,
                 'status'  => $response->status(),
             ]);
             return null;
@@ -107,7 +125,23 @@ class RedditService
         $children = $data['data']['children'] ?? [];
         $newAfter = $data['data']['after'] ?? null;
 
-        $posts = collect($children)->map(function (array $child) {
+        // Filter to kind=t3 (post submissions) only — without type=link, Reddit may include
+        // t5 subreddits and t2 user entries.
+        //
+        // IMPORTANT: The after-token from data.after is position-based across ALL 25 children
+        // (including any non-t3 entries). When non-t3 entries are present in a page:
+        //   - The cursor still advances by 25 positions (correct — those slots are consumed)
+        //   - We store fewer than 25 posts for that batch (the non-t3 positions are empty)
+        //   - The "filtered_nonpost" count in the job log reveals this discrepancy
+        //
+        // If users see (e.g.) 240 stored vs 249 expected, check whether the sum of
+        // filtered_nonpost across all batches equals the gap — that would confirm the
+        // "missing" entries were subreddits/users, not actual posts.
+        $t3Children      = collect($children)->filter(fn(array $c) => ($c['kind'] ?? '') === 't3');
+        $totalChildren   = count($children);
+        $filteredNonPost = $totalChildren - $t3Children->count();
+
+        $posts = $t3Children->map(function (array $child) {
             $p        = $child['data'] ?? [];
             $selftext = trim($p['selftext'] ?? '');
             if (in_array($selftext, ['[deleted]', '[removed]'], true)) {
@@ -128,73 +162,114 @@ class RedditService
                 'total_awards_received' => (int) ($p['total_awards_received'] ?? 0),
                 'created_utc'           => (int) ($p['created_utc'] ?? 0),
             ];
-        })->all();
+        })->values()->all();
 
         Log::info('Reddit searchPosts JSON: success', [
-            'keyword'   => $keyword,
-            'after_in'  => $afterToken,
-            'after_out' => $newAfter,
-            'count'     => count($posts),
+            'keyword'           => $keyword,
+            'api_url'           => $apiUrl,
+            'after_in'          => $afterToken,
+            'after_out'         => $newAfter,
+            'total_children'    => $totalChildren,
+            'filtered_nonpost'  => $filteredNonPost,
+            'post_count'        => count($posts),
         ]);
 
         return [
-            'posts'       => $posts,
-            'after'       => $newAfter,
-            'before'      => $data['data']['before'] ?? null,
-            'total_found' => count($posts),
+            'posts'            => $posts,
+            'after'            => $newAfter,
+            'before'           => $data['data']['before'] ?? null,
+            'total_found'      => count($posts),
+            'total_children'   => $totalChildren,   // raw count before kind=t3 filter
+            'filtered_nonpost' => $filteredNonPost, // non-t3 entries consumed by cursor
+            'api_url'          => $apiUrl,
         ];
     }
 
     /**
-     * Fetch one page via RSS. Always works. Returns the same normalized shape as the JSON path.
+     * Fetch posts via RSS, collecting across multiple pages until 25 posts are gathered.
      *
-     * `after` token for the next page: the Reddit fullname of the last entry in this page,
-     * but only when we received a full page (≥25 raw entries). Fewer = last page.
+     * WHY MULTI-PAGE:
+     * Reddit's RSS search mixes subreddit-home entries (no /comments/ URL) with actual
+     * post entries. A single RSS page (limit=25 raw entries) may yield only 22–24 posts
+     * after those subreddit entries are filtered. To guarantee a full 25-post batch this
+     * method fetches up to 3 consecutive RSS pages and combines their filtered posts.
      *
-     * @throws \Exception on connection failures (triggers job retry)
+     * AFTER-TOKEN STRATEGY:
+     * We set `after` to the Reddit fullname (t3_<id>) of the 25th STORED post — NOT the
+     * last raw entry. Using the last raw entry's position (which may be a subreddit) would
+     * cause the next batch to re-encounter the same subreddit slots every time, making
+     * every batch return only 22 posts forever. Using the 25th stored post's fullname
+     * advances the cursor past those subreddit slots, ensuring each batch starts fresh.
+     *
+     * @throws \Exception on 403/429/connection errors (triggers job retry with backoff)
      */
     private function searchPostsViaRss(string $keyword, ?string $afterToken): array
     {
-        $params = [
-            'q'     => $keyword,
-            'limit' => 25,
-            'sort'  => 'new',
-            't'     => 'all',
-        ];
-        if ($afterToken !== null) {
-            $params['after'] = $afterToken;
-        }
+        $allPosts    = [];
+        $fetchAfter  = $afterToken;
+        $isFinalPage = false;
+        $lastFullname = null;
 
-        try {
-            $response = $this->rssClient()->get('https://www.reddit.com/search.rss', $params);
-        } catch (Throwable $e) {
-            Log::error('Reddit searchPosts RSS: connection failed', [
-                'keyword' => $keyword,
-                'error'   => $e->getMessage(),
+        // Fetch up to 3 RSS pages to fill the batch to 25 posts.
+        for ($fetch = 0; $fetch <= 2; $fetch++) {
+            [$rawEntries, $lastFullname] = $this->doRssRequest($keyword, $fetchAfter);
+
+            // Keep only real posts; subreddit home-page links have no /comments/ in URL.
+            $pagePosts = array_values(array_filter(
+                $rawEntries,
+                fn(array $e) => str_contains($e['permalink'] ?? '', '/comments/')
+            ));
+
+            $filtered = count($rawEntries) - count($pagePosts);
+            if ($filtered > 0) {
+                Log::info('Reddit searchPosts RSS: filtered non-post entries', [
+                    'keyword'      => $keyword,
+                    'fetch'        => $fetch + 1,
+                    'after_used'   => $fetchAfter,
+                    'raw'          => count($rawEntries),
+                    'posts'        => count($pagePosts),
+                    'filtered_out' => $filtered,
+                ]);
+            }
+
+            $allPosts    = array_merge($allPosts, $pagePosts);
+            $isFinalPage = count($rawEntries) < 25 || $lastFullname === null;
+
+            if (count($allPosts) >= 25 || $isFinalPage) {
+                break;
+            }
+
+            // Still under 25 posts — advance the cursor and fetch another page.
+            $fetchAfter = $lastFullname;
+            Log::info('Reddit searchPosts RSS: page returned fewer than 25 posts — fetching extra page', [
+                'keyword'      => $keyword,
+                'fetch_done'   => $fetch + 1,
+                'posts_so_far' => count($allPosts),
+                'next_after'   => $fetchAfter,
             ]);
-            throw new \Exception('Reddit RSS connection failed: ' . $e->getMessage());
         }
 
-        if ($response->failed()) {
-            Log::error('Reddit searchPosts RSS: bad response', [
-                'keyword' => $keyword,
-                'status'  => $response->status(),
-            ]);
-            throw new \Exception('Reddit RSS request failed: HTTP ' . $response->status());
+        // Cap at exactly 25 posts per batch.
+        $posts = array_slice($allPosts, 0, 25);
+
+        // Build the after token for the next job batch.
+        // Use the fullname of the LAST POST WE ARE STORING (the 25th), not $lastFullname
+        // from parseRssPage. If we stored 25 posts collected across two RSS pages, the
+        // next batch must start after the 25th stored post — any carry-over posts from the
+        // partial second page will be naturally re-fetched in the next batch via this cursor.
+        if (count($posts) === 25) {
+            $lastExternalId = $posts[24]['external_id'] ?? null;
+            $newAfter       = $lastExternalId ? ('t3_' . $lastExternalId) : null;
+        } elseif (! $isFinalPage) {
+            // Safety net: hit the 3-page cap but pagination isn't finished.
+            // Fall back to the last known t3_ cursor so the next batch continues.
+            $newAfter = $lastFullname ?? null;
+        } else {
+            // Fewer than 25 posts exist in total — this is the last available batch.
+            $newAfter = null;
         }
 
-        [$rawEntries, $lastFullname] = $this->parseRssPage($response->body());
-
-        // Keep only actual posts — RSS search mixes subreddit home pages with post links
-        $posts = array_values(array_filter(
-            $rawEntries,
-            fn (array $e) => str_contains($e['permalink'] ?? '', '/comments/')
-        ));
-
-        // A full page (≥25 raw entries) means there are more results; use last fullname as cursor
-        $newAfter = (count($rawEntries) >= 25 && $lastFullname) ? $lastFullname : null;
-
-        $normalizedPosts = collect($posts)->map(fn (array $e) => [
+        $normalizedPosts = collect($posts)->map(fn(array $e) => [
             'id'                    => $e['external_id'] ?? null,
             'permalink'             => $e['permalink'] ?? null,
             'title'                 => $e['title'] ?? 'Untitled',
@@ -207,12 +282,19 @@ class RedditService
             'created_utc'           => 0,
         ])->all();
 
+        $baseRssUrl = 'https://www.reddit.com/search.rss?' . http_build_query(
+            array_filter(['q' => $keyword, 'limit' => 25, 'sort' => 'new', 't' => 'all', 'after' => $afterToken])
+        );
+
         Log::info('Reddit searchPosts RSS: success', [
-            'keyword'   => $keyword,
-            'after_in'  => $afterToken,
-            'after_out' => $newAfter,
-            'raw_count' => count($rawEntries),
-            'count'     => count($normalizedPosts),
+            'keyword'       => $keyword,
+            'api_url'       => $baseRssUrl,
+            'after_in'      => $afterToken,
+            'after_out'     => $newAfter,
+            'pages_fetched' => $fetch + 1,
+            'raw_collected' => count($allPosts),
+            'stored'        => count($posts),
+            'is_final_page' => $isFinalPage,
         ]);
 
         return [
@@ -221,6 +303,68 @@ class RedditService
             'before'      => null,
             'total_found' => count($normalizedPosts),
         ];
+    }
+
+    /**
+     * Execute a single RSS HTTP request and return parsed entries.
+     * Throws on all HTTP errors so the job's backoff() schedule handles retries.
+     *
+     * @return array{0: array, 1: string|null}  [rawEntries[], lastPostFullname|null]
+     * @throws \Exception on connection error / 403 / 429 / non-2xx response
+     */
+    private function doRssRequest(string $keyword, ?string $afterToken): array
+    {
+        $params = [
+            'q'     => $keyword,
+            'limit' => 25,
+            'sort'  => 'new',
+            't'     => 'all',
+        ];
+        if ($afterToken !== null) {
+            $params['after'] = $afterToken;
+        }
+
+        $apiUrl = 'https://www.reddit.com/search.rss?' . http_build_query($params);
+
+        try {
+            $response = $this->rssClient()->get('https://www.reddit.com/search.rss', $params);
+        } catch (Throwable $e) {
+            Log::error('Reddit searchPosts RSS: connection failed', [
+                'keyword' => $keyword,
+                'after'   => $afterToken,
+                'api_url' => $apiUrl,
+                'error'   => $e->getMessage(),
+            ]);
+            throw new \Exception('Reddit RSS connection failed: ' . $e->getMessage());
+        }
+
+        // 403/429 are transient — throw so the job retries with its backoff() schedule.
+        // Do NOT return empty — that would set after=null and mark the search fully synced
+        // while Reddit still has pages of posts remaining.
+        if (in_array($response->status(), [403, 429], true)) {
+            Log::warning('Reddit searchPosts RSS: rate-limited or blocked — will retry', [
+                'keyword' => $keyword,
+                'after'   => $afterToken,
+                'api_url' => $apiUrl,
+                'status'  => $response->status(),
+            ]);
+            throw new \Exception(
+                'Reddit RSS blocked (' . $response->status() . ') for keyword: ' . $keyword
+            );
+        }
+
+        if ($response->failed()) {
+            Log::error('Reddit searchPosts RSS: unexpected HTTP error', [
+                'keyword' => $keyword,
+                'after'   => $afterToken,
+                'api_url' => $apiUrl,
+                'status'  => $response->status(),
+                'body'    => substr($response->body(), 0, 200),
+            ]);
+            throw new \Exception('Reddit RSS request failed: HTTP ' . $response->status());
+        }
+
+        return $this->parseRssPage($response->body());
     }
 
     // -------------------------------------------------------------------------
@@ -316,7 +460,15 @@ class RedditService
                 'selftext'    => $selftext ?: null,
             ];
 
-            $lastFullname = $fullname;
+            // Only advance the pagination cursor when this entry IS a post (t3_ fullname).
+            // Non-post entries (subreddits t5_, users t2_) produce $fullname = null here.
+            // If we overwrote $lastFullname unconditionally, the final $lastFullname would
+            // be null whenever the last raw RSS entry happens to be a subreddit — causing
+            // $newAfter = null in the caller and a premature is_fully_synced = true flag
+            // even when hundreds of Reddit posts remain unfetched.
+            if ($fullname !== null) {
+                $lastFullname = $fullname;
+            }
         }
 
         return [$entries, $lastFullname];
