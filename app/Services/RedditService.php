@@ -232,7 +232,18 @@ class RedditService
                 ]);
             }
 
-            $allPosts    = array_merge($allPosts, $pagePosts);
+            // Merge and deduplicate by external_id immediately.
+            // Reddit's RSS pagination can return the same post on two consecutive pages
+            // when the cursor falls on a subreddit boundary. Without deduplication,
+            // allPosts would contain the same post twice, and firstOrCreate would see
+            // it first (INSERT) then see it again (SELECT → existing) — which is safe
+            // but wastes a slot in the 25-post cap. Deduplicating here prevents any
+            // duplicate from even reaching the job's storage loop.
+            $allPosts = collect(array_merge($allPosts, $pagePosts))
+                ->unique(fn(array $e) => $e['external_id'] ?? ($e['permalink'] ?? uniqid('', true)))
+                ->values()
+                ->all();
+
             $isFinalPage = count($rawEntries) < 25 || $lastFullname === null;
 
             if (count($allPosts) >= 25 || $isFinalPage) {

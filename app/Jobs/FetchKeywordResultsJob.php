@@ -46,11 +46,35 @@ class FetchKeywordResultsJob implements ShouldQueue
 
     public function handle(RedditService $reddit): void
     {
-        // Lock the record to prevent two simultaneous jobs from using the same after token
-        $search = DB::transaction(fn () => Search::lockForUpdate()->find($this->searchId));
+        // ── Atomic batch claim ────────────────────────────────────────────────
+        // The old pattern — DB::transaction(lockForUpdate) → release → update —
+        // was NOT safe. The row lock was released immediately after the SELECT,
+        // so two concurrent jobs both read the same reddit_after token, fetched
+        // the same Reddit page, and raced through firstOrCreate with no unique
+        // constraint, producing duplicate rows.
+        //
+        // Fix: one atomic UPDATE that changes status to 'running' only when the
+        // row is NOT already being processed. MySQL serialises concurrent UPDATEs
+        // on the same row, so exactly one job gets rows_affected = 1 and proceeds;
+        // any concurrent job gets rows_affected = 0 and exits immediately.
+        $claimed = DB::table('searches')
+            ->where('id', $this->searchId)
+            ->where('is_fully_synced', false)
+            ->where('status', '!=', 'running')   // don't steal a batch in progress
+            ->update(['status' => 'running']);
+
+        if ($claimed === 0) {
+            Log::info('FetchKeywordResultsJob: skipped — another job is already running or search is fully synced', [
+                'search_id' => $this->searchId,
+            ]);
+            return;
+        }
+
+        // Re-read after the claim so we have fresh pagination state.
+        $search = Search::find($this->searchId);
 
         if (! $search) {
-            Log::warning('FetchKeywordResultsJob: search not found', ['search_id' => $this->searchId]);
+            Log::warning('FetchKeywordResultsJob: search not found after claim', ['search_id' => $this->searchId]);
             return;
         }
 
@@ -62,11 +86,9 @@ class FetchKeywordResultsJob implements ShouldQueue
             return;
         }
 
-        $batchNumber = $search->getNextBatch();
-        $afterToken  = $search->reddit_after;
+        $batchNumber  = $search->getNextBatch();
+        $afterToken   = $search->reddit_after;
         $isFirstBatch = $batchNumber === 1;
-
-        $search->update(['status' => 'running']);
 
         // Build the expected API URL for this batch — useful for manual verification.
         $expectedApiUrl = 'https://www.reddit.com/search.json?' . http_build_query(
@@ -163,18 +185,39 @@ class FetchKeywordResultsJob implements ShouldQueue
 
                 $selftext = $this->cleanSelftext($post['selftext'] ?? '');
 
-                // firstOrCreate prevents duplicate results across batches.
-                $result = $search->results()->firstOrCreate(
-                    ['external_id' => $redditId],
-                    [
-                        'batch_number' => $batchNumber,
-                        'source'       => 'reddit',
-                        'permalink'    => $permalink,
-                        'title'        => Str::limit($post['title'] ?? 'Untitled', 255, ''),
-                        'url'          => $post['url'] ?? '#',
-                        'selftext'     => $selftext,
-                    ]
-                );
+                // firstOrCreate prevents duplicates within the same search session.
+                // The unique index on (search_id, external_id) prevents DB-level duplicates
+                // even under concurrent job execution. If two jobs race past the atomic
+                // claim check (e.g. a queued retry + a new dispatch arriving simultaneously),
+                // the second job's INSERT will fail with a 1062 Duplicate entry error.
+                // We catch that, fetch the existing row, and count it as a duplicate.
+                try {
+                    $result = $search->results()->firstOrCreate(
+                        ['external_id' => $redditId],
+                        [
+                            'batch_number' => $batchNumber,
+                            'source'       => 'reddit',
+                            'permalink'    => $permalink,
+                            'title'        => Str::limit($post['title'] ?? 'Untitled', 255, ''),
+                            'url'          => $post['url'] ?? '#',
+                            'selftext'     => $selftext,
+                        ]
+                    );
+                } catch (\Illuminate\Database\QueryException $e) {
+                    if ($e->errorInfo[1] ?? 0 === 1062) {
+                        // Unique constraint violation — concurrent job already inserted this post.
+                        $result = $search->results()->firstWhere('external_id', $redditId);
+                        if (! $result) {
+                            Log::error('FetchKeywordResultsJob: unique violation but record not found', [
+                                'search_id' => $this->searchId,
+                                'reddit_id' => $redditId,
+                            ]);
+                            continue;
+                        }
+                    } else {
+                        throw $e;
+                    }
+                }
 
                 if ($result->wasRecentlyCreated) {
                     $redditStored++;
@@ -194,17 +237,26 @@ class FetchKeywordResultsJob implements ShouldQueue
             $googleStored = 0;
             if ($isFirstBatch) {
                 foreach ($this->searchGoogle($search->keyword, 25) as $googleResult) {
-                    $result = $search->results()->firstOrCreate(
-                        ['external_id' => $googleResult['external_id'], 'source' => 'google'],
-                        [
-                            'batch_number' => $batchNumber,
-                            'source'       => 'google',
-                            'permalink'    => null,
-                            'title'        => $googleResult['title'],
-                            'url'          => $googleResult['url'],
-                            'selftext'     => null,
-                        ]
-                    );
+                    try {
+                        $result = $search->results()->firstOrCreate(
+                            ['external_id' => $googleResult['external_id']],
+                            [
+                                'batch_number' => $batchNumber,
+                                'source'       => 'google',
+                                'permalink'    => null,
+                                'title'        => $googleResult['title'],
+                                'url'          => $googleResult['url'],
+                                'selftext'     => null,
+                            ]
+                        );
+                    } catch (\Illuminate\Database\QueryException $e) {
+                        if ($e->errorInfo[1] ?? 0 === 1062) {
+                            $result = $search->results()->firstWhere('external_id', $googleResult['external_id']);
+                            if (! $result) continue;
+                        } else {
+                            throw $e;
+                        }
+                    }
 
                     if ($result->wasRecentlyCreated) {
                         $googleStored++;
