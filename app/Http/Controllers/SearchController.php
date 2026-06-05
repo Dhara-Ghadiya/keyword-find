@@ -10,10 +10,14 @@ use Illuminate\View\View;
 
 class SearchController extends Controller
 {
-    /** Homepage — search form only. */
+    /** Homepage — search form + previously searched keywords. */
     public function index(): View
     {
-        return view('home');
+        $searches = Search::withCount('results')
+            ->orderByDesc('updated_at')
+            ->get();
+
+        return view('home', compact('searches'));
     }
 
     /**
