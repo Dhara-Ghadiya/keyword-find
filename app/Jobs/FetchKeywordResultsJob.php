@@ -15,14 +15,19 @@ use Illuminate\Support\Str;
 use Throwable;
 
 /**
- * Fetches one batch (up to 25) of Reddit posts for a keyword, storing results
- * with batch_number and updating the search's pagination state (reddit_after,
- * total_fetched, is_fully_synced).
+ * Fetches one batch (up to 25) of Reddit posts for a keyword.
  *
- * Calling store() a second time with the same keyword picks up where the last
- * batch left off — fetching posts 26–50, 51–75, etc.
+ * Pagination contract:
+ *   Each user search dispatches one instance of this job.
+ *   The job reads reddit_after from the searches row, fetches the next page,
+ *   stores up to TARGET_BATCH_SIZE new results, and writes the updated cursor back.
+ *   Pagination ends when Reddit returns after = null.
  *
- * Google Custom Search is fetched only on the first batch (no pagination support).
+ * Multi-page fill loop:
+ *   If duplicates reduce the stored count below TARGET_BATCH_SIZE, the job
+ *   fetches up to MAX_EXTRA_PAGES additional Reddit pages within the same run.
+ *
+ * Google Custom Search is fetched only on the first batch (no pagination).
  */
 class FetchKeywordResultsJob implements ShouldQueue
 {
@@ -31,10 +36,9 @@ class FetchKeywordResultsJob implements ShouldQueue
     public int $tries   = 5;
     public int $timeout = 300;
 
-    /**
-     * Seconds to wait before each successive retry attempt.
-     * Gives Reddit's CDN time to un-block between retries after a 403/429.
-     */
+    private const TARGET_BATCH_SIZE = 25;
+    private const MAX_EXTRA_PAGES   = 5;
+
     public function backoff(): array
     {
         return [30, 60, 120, 300];
@@ -44,45 +48,54 @@ class FetchKeywordResultsJob implements ShouldQueue
         public readonly int $searchId
     ) {}
 
+    // -------------------------------------------------------------------------
+    // Main handler
+    // -------------------------------------------------------------------------
+
     public function handle(RedditService $reddit): void
     {
+        // ── Retry safety: reset stuck 'running' rows ──────────────────────────
+        // If attempt 1 was killed (OOM, SIGKILL) before the catch block could
+        // reset the status, the row stays 'running'. Reset it on retry so the
+        // claim below can succeed.
+        if ($this->attempts() > 1) {
+            DB::table('searches')
+                ->where('id', $this->searchId)
+                ->where('reddit_sync_status', 'running')
+                ->update(['reddit_sync_status' => 'queued']);
+        }
+
         // ── Atomic batch claim ────────────────────────────────────────────────
-        // The old pattern — DB::transaction(lockForUpdate) → release → update —
-        // was NOT safe. The row lock was released immediately after the SELECT,
-        // so two concurrent jobs both read the same reddit_after token, fetched
-        // the same Reddit page, and raced through firstOrCreate with no unique
-        // constraint, producing duplicate rows.
-        //
-        // Fix: one atomic UPDATE that changes status to 'running' only when the
-        // row is NOT already being processed. MySQL serialises concurrent UPDATEs
-        // on the same row, so exactly one job gets rows_affected = 1 and proceeds;
-        // any concurrent job gets rows_affected = 0 and exits immediately.
+        // One atomic UPDATE ensures only one concurrent job proceeds.
+        // Allow re-run when reddit_after is non-null (more pages exist), even if
+        // reddit_sync_status is already 'completed' (previous batch done, not final).
         $claimed = DB::table('searches')
             ->where('id', $this->searchId)
-            ->where('is_fully_synced', false)
-            ->where('status', '!=', 'running')   // don't steal a batch in progress
-            ->update(['status' => 'running']);
+            ->where('reddit_sync_status', '!=', 'running')
+            ->where(function ($q) {
+                $q->whereNotIn('reddit_sync_status', ['completed', 'no_results'])
+                  ->orWhereNotNull('reddit_after');
+            })
+            ->update(['reddit_sync_status' => 'running']);
 
         if ($claimed === 0) {
-            Log::info('FetchKeywordResultsJob: skipped — another job is already running or search is fully synced', [
+            Log::info('FetchKeywordResultsJob: skipped — already running or fully done', [
                 'search_id' => $this->searchId,
+                'attempt'   => $this->attempts(),
             ]);
             return;
         }
 
-        // Re-read after the claim so we have fresh pagination state.
         $search = Search::find($this->searchId);
 
         if (! $search) {
-            Log::warning('FetchKeywordResultsJob: search not found after claim', ['search_id' => $this->searchId]);
-            return;
-        }
-
-        if ($search->is_fully_synced) {
-            Log::info('FetchKeywordResultsJob: already fully synced', [
+            Log::warning('FetchKeywordResultsJob: search not found after claim', [
                 'search_id' => $this->searchId,
-                'keyword'   => $search->keyword,
             ]);
+            DB::table('searches')
+                ->where('id', $this->searchId)
+                ->where('reddit_sync_status', 'running')
+                ->update(['reddit_sync_status' => 'failed']);
             return;
         }
 
@@ -90,10 +103,13 @@ class FetchKeywordResultsJob implements ShouldQueue
         $afterToken   = $search->reddit_after;
         $isFirstBatch = $batchNumber === 1;
 
-        // Build the expected API URL for this batch — useful for manual verification.
+        // Strip any quote characters the user typed so the API performs a broad
+        // search instead of exact-phrase. "linkedin automation" → linkedin automation
+        $cleanKeyword = str_replace('"', '', $search->keyword);
+
         $expectedApiUrl = 'https://www.reddit.com/search.json?' . http_build_query(
             array_filter([
-                'q'     => $search->keyword,
+                'q'     => $cleanKeyword,
                 'limit' => 25,
                 'sort'  => 'new',
                 't'     => 'all',
@@ -102,138 +118,156 @@ class FetchKeywordResultsJob implements ShouldQueue
         );
 
         Log::info('FetchKeywordResultsJob: starting batch', [
-            'search_id'       => $this->searchId,
-            'keyword'         => $search->keyword,
-            'batch'           => $batchNumber,
-            'after_token'     => $afterToken,
-            'expected_api_url'=> $expectedApiUrl,
-            'total_fetched'   => $search->total_fetched,
+            'search_id'        => $this->searchId,
+            'keyword'          => $search->keyword,
+            'clean_keyword'    => $cleanKeyword,
+            'batch'            => $batchNumber,
+            'after_token_in'   => $afterToken,
+            'expected_api_url' => $expectedApiUrl,
+            'total_fetched'    => $search->total_fetched,
         ]);
 
         try {
-            // ── Reddit API (paginated, sort=new) ──────────────────────────────
-            $apiResult = $reddit->searchPosts($search->keyword, $afterToken);
+            // ── Multi-page fill loop ──────────────────────────────────────────
+            $redditStored        = 0;
+            $savedResults        = collect();
+            $duplicates          = 0;
+            $skipped             = 0;
+            $totalChildrenReddit = 0;
+            $filteredNonPost     = 0;
+            $totalPostsReturned  = 0;
+            $apiPagesConsumed    = 0;
+            $actualApiUrl        = $expectedApiUrl;
 
-            $posts             = $apiResult['posts'];
-            $newAfter          = $apiResult['after'];
-            // These fields are only set by the JSON path; RSS path uses different counters.
-            $totalChildrenReddit  = $apiResult['total_children']   ?? count($posts);
-            $filteredNonPost      = $apiResult['filtered_nonpost']  ?? 0;
-            $actualApiUrl         = $apiResult['api_url']           ?? $expectedApiUrl;
+            $currentAfter = $afterToken;
+            $newAfter     = null; // set before every break path
 
-            if (empty($posts)) {
-                // is_fully_synced = true ONLY when Reddit signals no more results (after = null).
-                // If $newAfter is non-null here it means the page had no storable posts (all
-                // entries were filtered as subreddits / users by the kind=t3 filter), yet Reddit
-                // still has more pages. In that case we advance the cursor WITHOUT marking done.
-                if ($newAfter !== null) {
-                    Log::warning('FetchKeywordResultsJob: empty post page with non-null after token — advancing cursor', [
+            while (true) {
+                $apiResult = $reddit->searchPosts($cleanKeyword, $currentAfter);
+                $apiPagesConsumed++;
+
+                $posts     = $apiResult['posts'];
+                $pageAfter = $apiResult['after'];
+
+                $totalChildrenReddit += $apiResult['total_children']  ?? count($posts);
+                $filteredNonPost     += $apiResult['filtered_nonpost'] ?? 0;
+                $totalPostsReturned  += count($posts);
+
+                if ($apiPagesConsumed === 1) {
+                    $actualApiUrl = $apiResult['api_url'] ?? $expectedApiUrl;
+                    Log::info('FetchKeywordResultsJob: Reddit API request', [
                         'search_id' => $this->searchId,
-                        'batch'     => $batchNumber,
-                        'after_in'  => $afterToken,
-                        'after_out' => $newAfter,
-                    ]);
-                    DB::table('searches')->where('id', $this->searchId)->update([
-                        'status'          => 'completed',
-                        'reddit_after'    => $newAfter,
-                        'is_fully_synced' => false,
-                        'last_synced_at'  => now(),
-                    ]);
-                } else {
-                    Log::info('FetchKeywordResultsJob: no posts and after=null — marking fully synced', [
-                        'search_id'     => $this->searchId,
-                        'batch'         => $batchNumber,
-                        'total_fetched' => $search->total_fetched,
-                    ]);
-                    $search->update([
-                        'status'          => $search->total_fetched > 0 ? 'completed' : 'no_results',
-                        'is_fully_synced' => true,
-                        'last_synced_at'  => now(),
+                        'url'       => $actualApiUrl,
+                        'after_in'  => $currentAfter,
+                        'returned'  => count($posts),
                     ]);
                 }
-                return;
-            }
 
-            // ── Store Reddit results ──────────────────────────────────────────
-            // $redditStored tracks only Reddit posts — used to advance total_fetched.
-            // Google results are NOT counted because getCurrentBatch() divides total_fetched
-            // by 25 to derive batch numbers; including Google posts inflates that value and
-            // assigns wrong batch_number labels to subsequent Reddit fetches.
-            $redditStored = 0;
-            $savedResults = collect();
-            $duplicates   = 0;
-            $skipped      = 0;
-
-            foreach ($posts as $post) {
-                $redditId  = $post['id'] ?? null;
-                $permalink = $post['permalink'] ?? null;
-
-                // Safety guard: skip entries that are not real posts.
-                // The service already filters these, but log them if any slip through.
-                if (! $redditId || ! str_contains($permalink ?? '', '/comments/')) {
-                    $skipped++;
-                    Log::info('FetchKeywordResultsJob: skipping non-post entry', [
-                        'search_id' => $this->searchId,
-                        'batch'     => $batchNumber,
-                        'id'        => $redditId,
-                        'permalink' => $permalink,
-                        'title'     => Str::limit($post['title'] ?? '', 80, ''),
-                        'reason'    => ! $redditId ? 'missing_id' : 'no_comments_in_permalink',
-                    ]);
-                    continue;
-                }
-
-                $selftext = $this->cleanSelftext($post['selftext'] ?? '');
-
-                // firstOrCreate prevents duplicates within the same search session.
-                // The unique index on (search_id, external_id) prevents DB-level duplicates
-                // even under concurrent job execution. If two jobs race past the atomic
-                // claim check (e.g. a queued retry + a new dispatch arriving simultaneously),
-                // the second job's INSERT will fail with a 1062 Duplicate entry error.
-                // We catch that, fetch the existing row, and count it as a duplicate.
-                try {
-                    $result = $search->results()->firstOrCreate(
-                        ['external_id' => $redditId],
-                        [
-                            'batch_number' => $batchNumber,
-                            'source'       => 'reddit',
-                            'permalink'    => $permalink,
-                            'title'        => Str::limit($post['title'] ?? 'Untitled', 255, ''),
-                            'url'          => $post['url'] ?? '#',
-                            'selftext'     => $selftext,
-                        ]
-                    );
-                } catch (\Illuminate\Database\QueryException $e) {
-                    if ($e->errorInfo[1] ?? 0 === 1062) {
-                        // Unique constraint violation — concurrent job already inserted this post.
-                        $result = $search->results()->firstWhere('external_id', $redditId);
-                        if (! $result) {
-                            Log::error('FetchKeywordResultsJob: unique violation but record not found', [
+                // ── Empty page ────────────────────────────────────────────────
+                if (empty($posts)) {
+                    if ($apiPagesConsumed === 1) {
+                        if ($pageAfter !== null) {
+                            // Empty page but more exist — advance cursor, not done yet
+                            Log::warning('FetchKeywordResultsJob: empty page with non-null after — advancing cursor', [
                                 'search_id' => $this->searchId,
-                                'reddit_id' => $redditId,
+                                'batch'     => $batchNumber,
+                                'after_in'  => $afterToken,
+                                'after_out' => $pageAfter,
                             ]);
+                            DB::table('searches')->where('id', $this->searchId)->update([
+                                'reddit_sync_status' => 'completed',
+                                'reddit_after'       => $pageAfter,
+                            ]);
+                        } else {
+                            // Reddit exhausted — mark fully done
+                            $this->markExhausted($search);
+                        }
+                        return;
+                    }
+                    // Extra page empty — take what we have
+                    $newAfter = $pageAfter; // null = done, non-null = skip ahead
+                    break;
+                }
+
+                // ── Store Reddit results ──────────────────────────────────────
+                foreach ($posts as $post) {
+                    $redditId  = $post['id'] ?? null;
+                    $permalink = $post['permalink'] ?? null;
+
+                    if (! $redditId || ! str_contains($permalink ?? '', '/comments/')) {
+                        $skipped++;
+                        continue;
+                    }
+
+                    $selftext = $this->cleanSelftext($post['selftext'] ?? '');
+
+                    try {
+                        $result = $search->results()->firstOrCreate(
+                            ['external_id' => $redditId],
+                            [
+                                'batch_number' => $batchNumber,
+                                'source'       => 'reddit',
+                                'permalink'    => $permalink,
+                                'title'        => Str::limit($post['title'] ?? 'Untitled', 255, ''),
+                                'url'          => $post['url'] ?? '#',
+                                'selftext'     => $selftext,
+                            ]
+                        );
+                    } catch (\Illuminate\Database\QueryException $e) {
+                        if (($e->errorInfo[1] ?? 0) === 1062) {
+                            $duplicates++;
                             continue;
                         }
-                    } else {
                         throw $e;
+                    }
+
+                    if ($result->wasRecentlyCreated) {
+                        $redditStored++;
+                        $savedResults->push($result);
+
+                        if ($redditStored >= self::TARGET_BATCH_SIZE) {
+                            $newAfter = 't3_' . $redditId;
+                            break; // break foreach only
+                        }
+                    } else {
+                        $duplicates++;
                     }
                 }
 
-                if ($result->wasRecentlyCreated) {
-                    $redditStored++;
-                    $savedResults->push($result);
-                } else {
-                    $duplicates++;
-                    Log::info('FetchKeywordResultsJob: duplicate post skipped', [
-                        'search_id' => $this->searchId,
-                        'batch'     => $batchNumber,
-                        'reddit_id' => $redditId,
-                        'permalink' => $permalink,
-                    ]);
+                // ── Post-page break conditions ────────────────────────────────
+                if ($redditStored >= self::TARGET_BATCH_SIZE) {
+                    break; // $newAfter set inside foreach
                 }
+
+                if ($pageAfter === null) {
+                    $newAfter = null;
+                    break;
+                }
+
+                if ($apiPagesConsumed > self::MAX_EXTRA_PAGES) {
+                    $newAfter = $pageAfter;
+                    Log::warning('FetchKeywordResultsJob: extra page limit reached — saving partial batch', [
+                        'search_id'  => $this->searchId,
+                        'batch'      => $batchNumber,
+                        'pages'      => $apiPagesConsumed,
+                        'stored'     => $redditStored,
+                        'duplicates' => $duplicates,
+                    ]);
+                    break;
+                }
+
+                Log::info('FetchKeywordResultsJob: fetching extra page to fill batch', [
+                    'search_id'  => $this->searchId,
+                    'batch'      => $batchNumber,
+                    'pages_done' => $apiPagesConsumed,
+                    'stored'     => $redditStored,
+                    'need_more'  => self::TARGET_BATCH_SIZE - $redditStored,
+                ]);
+
+                $currentAfter = $pageAfter;
             }
 
-            // ── Google results (first batch only — no after-token pagination) ──
+            // ── Google results (first batch only) ─────────────────────────────
             $googleStored = 0;
             if ($isFirstBatch) {
                 foreach ($this->searchGoogle($search->keyword, 25) as $googleResult) {
@@ -250,12 +284,10 @@ class FetchKeywordResultsJob implements ShouldQueue
                             ]
                         );
                     } catch (\Illuminate\Database\QueryException $e) {
-                        if ($e->errorInfo[1] ?? 0 === 1062) {
-                            $result = $search->results()->firstWhere('external_id', $googleResult['external_id']);
-                            if (! $result) continue;
-                        } else {
-                            throw $e;
+                        if (($e->errorInfo[1] ?? 0) === 1062) {
+                            continue;
                         }
+                        throw $e;
                     }
 
                     if ($result->wasRecentlyCreated) {
@@ -264,92 +296,72 @@ class FetchKeywordResultsJob implements ShouldQueue
                 }
             }
 
-            // ── Update search pagination state ────────────────────────────────
-            // is_fully_synced = true ONLY when Reddit's API returns after = null.
-            // Never infer completion from insert counts, duplicate counts, or total_fetched.
-            $isFullySynced = $newAfter === null;
+            // ── Update pagination state ───────────────────────────────────────
+            $isDone = $newAfter === null;
 
-            // Atomic SQL increment for total_fetched avoids a read-modify-write race when
-            // the user double-clicks Retry and two jobs overlap briefly. Only Reddit posts
-            // advance the counter — Google posts must not skew the batch-number arithmetic.
             DB::table('searches')->where('id', $this->searchId)->update([
-                'status'          => 'completed',
-                'reddit_after'    => $newAfter,
-                'is_fully_synced' => $isFullySynced,
-                'last_synced_at'  => now(),
-                'total_fetched'   => DB::raw('total_fetched + ' . $redditStored),
+                'reddit_sync_status' => $isDone
+                    ? ($redditStored + $search->total_fetched > 0 ? 'completed' : 'no_results')
+                    : 'completed',
+                'reddit_after'  => $newAfter,
+                'total_fetched' => DB::raw('total_fetched + ' . $redditStored),
             ]);
 
-            // ── Dispatch detail-fetch jobs for new Reddit results ─────────────
             $this->dispatchDetailJobs($savedResults, $search->id);
 
             $search->refresh();
 
             Log::info('FetchKeywordResultsJob: batch complete', [
-                'search_id'              => $this->searchId,
-                'keyword'                => $search->keyword,
-                'batch'                  => $batchNumber,
-                'api_url'                => $actualApiUrl,
-                'after_in'               => $afterToken,
-                'after_out'              => $newAfter,
-                // reddit_children_total: raw count Reddit returned BEFORE kind=t3 filter.
-                // reddit_filtered_nonpost: non-t3 entries (subreddits/users) that consumed
-                //   cursor positions but were not stored. Sum this across all batches to
-                //   explain any gap between Reddit's reported total and stored count.
-                'reddit_children_total'  => $totalChildrenReddit,
-                'reddit_filtered_nonpost'=> $filteredNonPost,
-                'reddit_t3_returned'     => count($posts),
-                'reddit_stored'          => $redditStored,
-                'reddit_duplicates'      => $duplicates,
-                'reddit_skipped'         => $skipped,
-                'google_stored'          => $googleStored,
-                'is_fully_synced'        => $isFullySynced,
-                'total_fetched'          => $search->total_fetched,
+                'search_id'               => $this->searchId,
+                'keyword'                 => $search->keyword,
+                'batch'                   => $batchNumber,
+                'api_url'                 => $actualApiUrl,
+                'after_in'                => $afterToken,
+                'after_out'               => $newAfter,
+                'api_pages_consumed'      => $apiPagesConsumed,
+                'reddit_children_total'   => $totalChildrenReddit,
+                'reddit_filtered_nonpost' => $filteredNonPost,
+                'reddit_t3_returned'      => $totalPostsReturned,
+                'reddit_stored'           => $redditStored,
+                'reddit_duplicates'       => $duplicates,
+                'reddit_skipped'          => $skipped,
+                'google_stored'           => $googleStored,
+                'is_done'                 => $isDone,
+                'total_fetched'           => $search->total_fetched,
             ]);
 
-            // Emit an explicit completion log when all available Reddit posts have been
-            // fetched. This appears in the log as a single authoritative summary line.
-            if ($isFullySynced) {
-                Log::info('FetchKeywordResultsJob: pagination complete — after=null received', [
+            if ($isDone) {
+                Log::info('FetchKeywordResultsJob: Reddit pagination complete — after=null received', [
                     'search_id'    => $this->searchId,
                     'keyword'      => $search->keyword,
                     'total_fetched'=> $search->total_fetched,
                     'batches'      => $search->getCurrentBatch(),
-                    'after_in'     => $afterToken,
-                    'final_api_url'=> $actualApiUrl,
                 ]);
             }
 
         } catch (Throwable $exception) {
-            // Do NOT set status='failed' on each individual attempt. Setting it here means
-            // the UI shows "failed" during the 30s/60s/120s backoff delays between Laravel's
-            // automatic retries. Users see the Retry button and click it, dispatching a new
-            // job while the original retries are still queued — two concurrent jobs race on
-            // the same reddit_after token.
-            //
-            // Status stays 'running' during all auto-retries. Only failed() below sets it
-            // to 'failed', once, after all $tries are exhausted.
+            // Reset to queued so Laravel's auto-retry can re-claim the row.
+            DB::table('searches')
+                ->where('id', $this->searchId)
+                ->where('reddit_sync_status', 'running')
+                ->update(['reddit_sync_status' => 'queued']);
 
-            Log::error('FetchKeywordResultsJob: attempt failed', [
+            Log::error('FetchKeywordResultsJob: attempt failed — reset to queued for retry', [
                 'search_id'  => $this->searchId,
-                'keyword'    => $search->keyword,
-                'batch'      => $batchNumber,
-                'after_in'   => $afterToken,
                 'attempt'    => $this->attempts(),
                 'tries_left' => $this->tries - $this->attempts(),
                 'exception'  => get_class($exception),
                 'message'    => $exception->getMessage(),
             ]);
 
-            throw $exception;   // Let Laravel retry with backoff()
+            throw $exception;
         }
     }
 
-    /**
-     * Called by Laravel after all $tries attempts are exhausted.
-     * This is the ONLY place that sets status='failed' — exactly once, when the job
-     * has truly given up — so the Retry button appears only when it should.
-     */
+    // -------------------------------------------------------------------------
+    // Permanent failure hook
+    // -------------------------------------------------------------------------
+
     public function failed(Throwable $exception): void
     {
         Log::error('FetchKeywordResultsJob: all retries exhausted', [
@@ -358,16 +370,31 @@ class FetchKeywordResultsJob implements ShouldQueue
             'message'   => $exception->getMessage(),
         ]);
 
-        // Guard: never downgrade a batch that already completed successfully.
         DB::table('searches')
             ->where('id', $this->searchId)
-            ->where('status', '!=', 'completed')
-            ->update(['status' => 'failed']);
+            ->whereNotIn('reddit_sync_status', ['completed', 'no_results'])
+            ->update(['reddit_sync_status' => 'failed']);
     }
 
     // -------------------------------------------------------------------------
-    // Helpers
+    // Private helpers
     // -------------------------------------------------------------------------
+
+    private function markExhausted(Search $search): void
+    {
+        $isDone = $search->total_fetched > 0;
+
+        DB::table('searches')->where('id', $this->searchId)->update([
+            'reddit_sync_status' => $isDone ? 'completed' : 'no_results',
+            'reddit_after'       => null,
+        ]);
+
+        Log::info('FetchKeywordResultsJob: Reddit exhausted — after=null with empty page', [
+            'search_id'    => $this->searchId,
+            'keyword'      => $search->keyword,
+            'total_fetched'=> $search->total_fetched,
+        ]);
+    }
 
     private function dispatchDetailJobs(\Illuminate\Support\Collection $results, int $searchId): void
     {
@@ -392,10 +419,6 @@ class FetchKeywordResultsJob implements ShouldQueue
         }
     }
 
-    /**
-     * Clean Reddit selftext — remove HTML entities and the "submitted by /u/..."
-     * footer that appears in RSS-sourced content.
-     */
     private function cleanSelftext(string $raw): ?string
     {
         if ($raw === '' || in_array($raw, ['[deleted]', '[removed]'], true)) {
@@ -410,7 +433,7 @@ class FetchKeywordResultsJob implements ShouldQueue
     }
 
     // -------------------------------------------------------------------------
-    // Google Custom Search API (optional — requires API credentials in .env)
+    // Google Custom Search (optional — requires API credentials in .env)
     // -------------------------------------------------------------------------
 
     private function searchGoogle(string $keyword, int $limit): array
@@ -440,7 +463,10 @@ class FetchKeywordResultsJob implements ShouldQueue
                     ->all();
             });
         } catch (Throwable $e) {
-            Log::warning('Google search pool failed', ['error' => $e->getMessage()]);
+            Log::warning('FetchKeywordResultsJob: Google search pool failed', [
+                'search_id' => $this->searchId,
+                'error'     => $e->getMessage(),
+            ]);
             return [];
         }
 
@@ -456,7 +482,9 @@ class FetchKeywordResultsJob implements ShouldQueue
                     'title'       => Str::limit($item['title'] ?? 'Untitled', 255, ''),
                     'url'         => $item['link'] ?? '#',
                 ];
-                if (count($results) >= $limit) break 2;
+                if (count($results) >= $limit) {
+                    break 2;
+                }
             }
         }
 

@@ -92,7 +92,7 @@
                             @foreach ($searches as $s)
                                 @php
                                     $postCount   = $s->total_fetched > 0 ? $s->total_fetched : $s->results_count;
-                                    $statusColor = match($s->status) {
+                                    $statusColor = match($s->reddit_sync_status) {
                                         'completed'  => 'bg-teal-50 text-teal-700 border-teal-200',
                                         'running'    => 'bg-blue-50 text-blue-700 border-blue-200',
                                         'queued'     => 'bg-amber-50 text-amber-700 border-amber-200',
@@ -106,10 +106,10 @@
                                     <td class="px-5 py-3 text-slate-600">{{ $postCount }}</td>
                                     <td class="px-5 py-3">
                                         <span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-semibold {{ $statusColor }}">
-                                            @if (in_array($s->status, ['queued', 'running']))
+                                            @if (in_array($s->reddit_sync_status, ['queued', 'running']))
                                                 <span class="size-1.5 animate-pulse rounded-full bg-current"></span>
                                             @endif
-                                            {{ ucfirst(str_replace('_', ' ', $s->status)) }}
+                                            {{ ucfirst(str_replace('_', ' ', $s->reddit_sync_status)) }}
                                         </span>
                                     </td>
                                     <td class="px-5 py-3 text-right">
@@ -128,7 +128,6 @@
                 </div>
             @endif
 
-           
         </div>
     </section>
 
