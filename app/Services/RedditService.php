@@ -86,7 +86,7 @@ class RedditService
     private function searchPostsViaJson(string $keyword, ?string $afterToken): ?array
     {
         $params = [
-            'q'     => $keyword,
+            'q'     => '"' . $keyword . '"',
             'limit' => 25,
             'sort'  => 'new',
             't'     => 'all',
@@ -212,6 +212,9 @@ class RedditService
 
         // Fetch up to 3 RSS pages to fill the batch to 25 posts.
         for ($fetch = 0; $fetch <= 2; $fetch++) {
+            if ($fetch > 0) {
+                usleep(500_000); // 0.5 s between consecutive RSS pages — avoids 429 bursts
+            }
             [$rawEntries, $lastFullname] = $this->doRssRequest($keyword, $fetchAfter);
 
             // Keep only real posts; subreddit home-page links have no /comments/ in URL.
@@ -294,7 +297,7 @@ class RedditService
         ])->all();
 
         $baseRssUrl = 'https://www.reddit.com/search.rss?' . http_build_query(
-            array_filter(['q' => $keyword, 'limit' => 25, 'sort' => 'new', 't' => 'all', 'after' => $afterToken])
+            array_filter(['q' => '"' . $keyword . '"', 'limit' => 25, 'sort' => 'new', 't' => 'all', 'after' => $afterToken])
         );
 
         Log::info('Reddit searchPosts RSS: success', [
@@ -326,7 +329,7 @@ class RedditService
     private function doRssRequest(string $keyword, ?string $afterToken): array
     {
         $params = [
-            'q'     => $keyword,
+            'q'     => '"' . $keyword . '"',
             'limit' => 25,
             'sort'  => 'new',
             't'     => 'all',

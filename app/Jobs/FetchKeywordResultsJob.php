@@ -33,7 +33,7 @@ class FetchKeywordResultsJob implements ShouldQueue
 {
     use Queueable;
 
-    public int $tries   = 5;
+    public int $tries   = 7;
     public int $timeout = 300;
 
     private const TARGET_BATCH_SIZE = 25;
@@ -41,7 +41,7 @@ class FetchKeywordResultsJob implements ShouldQueue
 
     public function backoff(): array
     {
-        return [30, 60, 120, 300];
+        return [30, 60, 120, 300, 600, 600];
     }
 
     public function __construct(
@@ -103,13 +103,13 @@ class FetchKeywordResultsJob implements ShouldQueue
         $afterToken   = $search->reddit_after;
         $isFirstBatch = $batchNumber === 1;
 
-        // Strip any quote characters the user typed so the API performs a broad
-        // search instead of exact-phrase. "linkedin automation" → linkedin automation
+        // Strip user-typed quote chars; RedditService re-wraps the phrase in double
+        // quotes for exact-phrase API search: q="linkedin automation" on Reddit.
         $cleanKeyword = str_replace('"', '', $search->keyword);
 
         $expectedApiUrl = 'https://www.reddit.com/search.json?' . http_build_query(
             array_filter([
-                'q'     => $cleanKeyword,
+                'q'     => '"' . $cleanKeyword . '"',
                 'limit' => 25,
                 'sort'  => 'new',
                 't'     => 'all',
@@ -133,6 +133,7 @@ class FetchKeywordResultsJob implements ShouldQueue
             $savedResults        = collect();
             $duplicates          = 0;
             $skipped             = 0;
+            $keywordFiltered     = 0;
             $totalChildrenReddit = 0;
             $filteredNonPost     = 0;
             $totalPostsReturned  = 0;
@@ -146,20 +147,32 @@ class FetchKeywordResultsJob implements ShouldQueue
                 $apiResult = $reddit->searchPosts($cleanKeyword, $currentAfter);
                 $apiPagesConsumed++;
 
-                $posts     = $apiResult['posts'];
+                $rawPosts  = $apiResult['posts'];
                 $pageAfter = $apiResult['after'];
 
-                $totalChildrenReddit += $apiResult['total_children']  ?? count($posts);
+                $totalChildrenReddit += $apiResult['total_children']  ?? count($rawPosts);
                 $filteredNonPost     += $apiResult['filtered_nonpost'] ?? 0;
-                $totalPostsReturned  += count($posts);
+                $totalPostsReturned  += count($rawPosts);
+
+                // Phrase filter — secondary safety net after exact-phrase API search.
+                // Drops any post whose title AND body both lack the keyword phrase.
+                $phrase    = mb_strtolower($cleanKeyword);
+                $posts     = array_values(array_filter(
+                    $rawPosts,
+                    fn (array $p) => str_contains(mb_strtolower($p['title'] ?? ''), $phrase)
+                                  || str_contains(mb_strtolower($p['selftext'] ?? ''), $phrase)
+                ));
+                $keywordFiltered += count($rawPosts) - count($posts);
 
                 if ($apiPagesConsumed === 1) {
                     $actualApiUrl = $apiResult['api_url'] ?? $expectedApiUrl;
                     Log::info('FetchKeywordResultsJob: Reddit API request', [
-                        'search_id' => $this->searchId,
-                        'url'       => $actualApiUrl,
-                        'after_in'  => $currentAfter,
-                        'returned'  => count($posts),
+                        'search_id'          => $this->searchId,
+                        'url'                => $actualApiUrl,
+                        'keyword'            => $cleanKeyword,
+                        'after_in'           => $currentAfter,
+                        'returned'           => count($rawPosts),
+                        'after_phrase_filter'=> count($posts),
                     ]);
                 }
 
@@ -322,6 +335,7 @@ class FetchKeywordResultsJob implements ShouldQueue
                 'reddit_children_total'   => $totalChildrenReddit,
                 'reddit_filtered_nonpost' => $filteredNonPost,
                 'reddit_t3_returned'      => $totalPostsReturned,
+                'reddit_keyword_filtered' => $keywordFiltered,
                 'reddit_stored'           => $redditStored,
                 'reddit_duplicates'       => $duplicates,
                 'reddit_skipped'          => $skipped,
