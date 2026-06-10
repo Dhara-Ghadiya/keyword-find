@@ -32,6 +32,19 @@
 
             <div class="rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-8">
 
+                @php
+                    $isDone         = $search->isFullyDone();
+                    $isProcessing   = in_array($search->reddit_sync_status, ['queued', 'running']);
+                    $statusColor    = match($search->reddit_sync_status) {
+                        'completed'  => 'bg-teal-50 text-teal-700 border-teal-200',
+                        'running'    => 'bg-blue-50 text-blue-700 border-blue-200',
+                        'queued'     => 'bg-amber-50 text-amber-700 border-amber-200',
+                        'no_results' => 'bg-slate-50 text-slate-600 border-slate-200',
+                        'failed'     => 'bg-rose-50 text-rose-700 border-rose-200',
+                        default      => 'bg-slate-50 text-slate-600 border-slate-200',
+                    };
+                @endphp
+
                 {{-- Keyword + status bar --}}
                 <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                     <div>
@@ -42,7 +55,7 @@
                         <p class="mt-1 text-sm text-slate-500">
                             @if ($search->total_fetched > 0)
                                 {{ $search->total_fetched }} posts fetched across {{ $search->getCurrentBatch() }} {{ Str::plural('batch', $search->getCurrentBatch()) }}
-                                @if (! $search->is_fully_synced)
+                                @if (! $isDone)
                                     &mdash; more available
                                 @endif
                             @else
@@ -53,28 +66,17 @@
 
                     <div class="flex flex-col items-start gap-2 sm:items-end">
                         {{-- Status badge --}}
-                        @php
-                            $statusColor = match($search->status) {
-                                'completed'  => 'bg-teal-50 text-teal-700 border-teal-200',
-                                'running'    => 'bg-blue-50 text-blue-700 border-blue-200',
-                                'queued'     => 'bg-amber-50 text-amber-700 border-amber-200',
-                                'no_results' => 'bg-slate-50 text-slate-600 border-slate-200',
-                                'failed'     => 'bg-rose-50 text-rose-700 border-rose-200',
-                                default      => 'bg-slate-50 text-slate-600 border-slate-200',
-                            };
-                        @endphp
-
                         <span class="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-semibold {{ $statusColor }}">
-                            @if (in_array($search->status, ['queued', 'running']))
+                            @if ($isProcessing)
                                 <span class="size-2 animate-pulse rounded-full bg-current"></span>
                             @endif
-                            {{ ucfirst(str_replace('_', ' ', $search->status)) }}
+                            {{ ucfirst(str_replace('_', ' ', $search->reddit_sync_status)) }}
                         </span>
 
-                        {{-- More available hint --}}
-                        @if ($search->is_fully_synced)
+                        {{-- Pagination hint --}}
+                        @if ($isDone)
                             <span class="text-xs text-slate-400">All Reddit posts fetched</span>
-                        @elseif (! in_array($search->status, ['queued', 'running']) && $search->total_fetched > 0)
+                        @elseif (! $isProcessing && $search->total_fetched > 0)
                             <span class="text-xs text-slate-500">
                                 More available — search this keyword again to fetch the next 25
                             </span>
@@ -83,7 +85,7 @@
                 </div>
 
                 {{-- Processing notice --}}
-                @if (in_array($search->status, ['queued', 'running']))
+                @if ($isProcessing)
                     <div class="mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
                         Fetching batch {{ $search->getNextBatch() }} — page refreshes automatically every 3 seconds.
                     </div>
@@ -102,7 +104,7 @@
                 @endif
 
                 {{-- No results --}}
-                @if ($search->status === 'no_results' || ($search->status === 'completed' && $results->isEmpty()))
+                @if ($search->reddit_sync_status === 'no_results' || ($search->reddit_sync_status === 'completed' && $results->isEmpty()))
                     <div class="mt-8 rounded-lg border border-slate-200 bg-slate-50 px-4 py-10 text-center">
                         <p class="text-base font-semibold text-slate-900">No results found</p>
                         <p class="mt-2 text-sm text-slate-500">Try a broader keyword or a different topic.</p>
@@ -113,7 +115,7 @@
                 @endif
 
                 {{-- Failed --}}
-                @if ($search->status === 'failed')
+                @if ($search->reddit_sync_status === 'failed')
                     <div class="mt-8 rounded-lg border border-rose-200 bg-rose-50 px-4 py-6 text-center">
                         <p class="text-base font-semibold text-rose-800">Search failed</p>
                         <p class="mt-2 text-sm text-rose-600">An error occurred. Please try again.</p>
@@ -177,7 +179,7 @@
     </section>
 
     <script>
-        @if (in_array($search->status, ['queued', 'running']))
+        @if ($isProcessing)
             setTimeout(() => window.location.reload(), 3000);
         @endif
     </script>

@@ -10,17 +10,24 @@ use Illuminate\View\View;
 
 class SearchController extends Controller
 {
-    /** Homepage — search form only. */
+    /** Homepage — search form + previously searched keywords. */
     public function index(): View
     {
-        return view('home');
+        $searches = Search::withCount('results')
+            ->orderByDesc('updated_at')
+            ->get();
+
+        return view('home', compact('searches'));
     }
 
     /**
-     * Validate keyword, find or create a Search record, dispatch fetch job,
-     * redirect to the results page.
+     * Validate keyword, find or create a Search record, dispatch the
+     * next Reddit fetch batch, and redirect to the results page.
      *
-     * Same keyword → continues pagination (fetches next 25 posts).
+     * Pagination contract:
+     *   Each submission fetches the next 25 Reddit posts.
+     *   Pagination ends when reddit_after = null AND reddit_sync_status
+     *   is 'completed' or 'no_results'.
      */
     public function store(Request $request): RedirectResponse
     {
@@ -29,41 +36,34 @@ class SearchController extends Controller
         ]);
 
         $keyword = trim($request->input('keyword'));
+        $search  = Search::where('keyword', $keyword)->latest()->first();
 
-        // Find the most recent search record for this keyword
-        $search = Search::where('keyword', $keyword)->latest()->first();
-
-        // All Reddit posts for this keyword have been fetched
-        if ($search && $search->is_fully_synced) {
+        // All Reddit posts fetched — nothing more to do
+        if ($search && $search->isFullyDone()) {
             return redirect()
                 ->route('searches.show', $search)
                 ->with('info', 'All available Reddit posts for "' . $keyword . '" have been fetched ('
                     . $search->total_fetched . ' total). Reddit has no more results.');
         }
 
-        // Rate-limit: prevent hammering the same keyword within 1 minute
-        if ($search
-            && $search->last_synced_at
-            && $search->last_synced_at->diffInSeconds(now()) < 60
-            && in_array($search->status, ['queued', 'running'], true)
-        ) {
+        // Block duplicate dispatch while a batch is in flight
+        if ($search && in_array($search->reddit_sync_status, ['queued', 'running'], true)) {
             return redirect()
                 ->route('searches.show', $search)
                 ->with('warning', 'This keyword is already being fetched. Please wait.');
         }
 
-        // First search for this keyword → create new record
+        // First search — create record
         if (! $search) {
             $search = Search::create([
-                'keyword'         => $keyword,
-                'status'          => 'queued',
-                'reddit_after'    => null,
-                'is_fully_synced' => false,
-                'total_fetched'   => 0,
+                'keyword'            => $keyword,
+                'reddit_sync_status' => 'queued',
+                'reddit_after'       => null,
+                'total_fetched'      => 0,
             ]);
         } else {
-            // Subsequent search → reuse record, queue next batch
-            $search->update(['status' => 'queued']);
+            // Subsequent search — queue next batch
+            $search->update(['reddit_sync_status' => 'queued']);
         }
 
         FetchKeywordResultsJob::dispatch($search->id);
@@ -72,8 +72,7 @@ class SearchController extends Controller
     }
 
     /**
-     * Results page for a specific search.
-     * Results paginated 25 per page, ordered by batch then insertion order.
+     * Results page — GET only, never dispatches any jobs.
      */
     public function show(Search $search): View
     {
